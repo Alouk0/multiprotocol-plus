@@ -1,0 +1,55 @@
+#!/bin/bash
+# MultiPlus+ Enhanced — Domain & SSL manager (acme.sh standalone)
+set -euo pipefail
+green=$(tput setaf 2); red=$(tput setaf 1); yellow=$(tput setaf 3); cyan=$(tput setaf 6); reset=$(tput sgr0)
+
+CERT_DIR="/etc/xray/cert"
+mkdir -p "$CERT_DIR"
+
+if ! command -v acme.sh >/dev/null 2>&1; then
+  echo -e "${yellow}acme.sh not found. Installing...${reset}"
+  curl https://get.acme.sh | sh
+  export PATH="$HOME/.acme.sh:$PATH"
+fi
+
+read -rp "Enter domain (A record must point to this server): " DOMAIN
+read -rp "Enter email for Let's Encrypt notifications: " EMAIL
+
+echo -e "${cyan}Issuing certificate (standalone HTTP-01 on port 80)...${reset}"
+systemctl stop xray 2>/dev/null || true
+systemctl stop trojan-go 2>/dev/null || true
+systemctl stop nginx 2>/dev/null || true
+ufw allow 80/tcp >/dev/null 2>&1 || true
+
+~/.acme.sh/acme.sh --register-account -m "$EMAIL" >/dev/null 2>&1 || true
+~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone || {
+  echo -e "${red}Certificate issuance failed. Ensure port 80 is free and DNS points here.${reset}"
+  exit 1
+}
+
+~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
+  --key-file       "$CERT_DIR/key.pem" \
+  --fullchain-file "$CERT_DIR/fullchain.pem" \
+  --reloadcmd "systemctl restart xray || true"
+
+echo -e "${green}Certificate installed at:${reset} $CERT_DIR"
+echo -e "${yellow}Restarting services...${reset}"
+systemctl restart xray 2>/dev/null || true
+systemctl restart trojan-go 2>/dev/null || true
+
+# Optional: embed domain hint into /etc/xray/config.json if not present
+if [ -f /etc/xray/config.json ]; then
+  if ! grep -q '"server_name"' /etc/xray/config.json; then
+    jq --arg d "$DOMAIN" '
+      .inbounds |= map(
+        .streamSettings? // empty
+        | if .security == "tls" then
+            .tlsSettings.serverName = $d | .
+          else
+            .
+          end
+      )' /etc/xray/config.json >/tmp/xray.tmp 2>/dev/null && mv /tmp/xray.tmp /etc/xray/config.json
+  fi
+fi
+
+echo -e "${green}Done. Domain set to ${DOMAIN} and services reloaded.${reset}"
